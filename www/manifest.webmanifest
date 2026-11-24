@@ -1,1 +1,16 @@
-{"name":"Loopsy Doopsy Compatible","short_name":"Loopsy Compatible","start_url":"./","scope":"./","display":"standalone","background_color":"#f7f5ef","theme_color":"#f7f5ef","icons":[{"src":"icons/icon-192.png","sizes":"192x192","type":"image/png"},{"src":"icons/icon-512.png","sizes":"512x512","type":"image/png"}]}
+{
+  "name": "Loopsy Doopsy Compatible",
+  "short_name": "Loopsy Compatible",
+  "description": "Record colourful, perfectly timed loops on eight pads and jam over the top.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1c1b22",
+  "theme_color": "#1c1b22",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

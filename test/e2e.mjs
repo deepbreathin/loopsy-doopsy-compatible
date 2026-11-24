@@ -1,0 +1,416 @@
+// End-to-end test: real Chromium, fake microphone, phone-sized viewport.
+// Run: npm run test:e2e   (needs Playwright; uses the globally installed one if present)
+import { createRequire } from 'node:module';
+import { spawn, execFileSync, execSync } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import assert from 'node:assert/strict';
+
+const require = createRequire(import.meta.url);
+let chromium;
+try {
+  ({ chromium } = require('playwright'));
+} catch {
+  ({ chromium } = require(execSync('npm root -g').toString().trim() + '/playwright'));
+}
+
+const PORT = 8224;
+const server = spawn('python3', ['-m', 'http.server', String(PORT), '-d', new URL('../www/', import.meta.url).pathname], { stdio: 'ignore' });
+const shots = new URL('./screens/', import.meta.url).pathname;
+mkdirSync(shots, { recursive: true });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const browser = await chromium.launch({
+  args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
+});
+const errors = [];
+try {
+  await sleep(500);
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, permissions: ['microphone'] });
+  await ctx.addInitScript(() => {
+    // Simulate the native share sheet on platforms that accept files.
+    Object.defineProperty(navigator, 'canShare', { value: ({ files }) => files.every((file) => file.type === 'audio/wav') });
+    Object.defineProperty(navigator, 'share', { value: async ({ files }) => {
+      window.sharedFileNames = files.map((file) => file.name);
+    } });
+  });
+  const page = await ctx.newPage();
+  page.on('pageerror', (e) => errors.push(e.message));
+  page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+  const until = (fn, arg, timeout = 6000) => page.waitForFunction(fn, arg, { timeout });
+  const ev = (fn, arg) => page.evaluate(fn, arg);
+
+  await page.goto(`http://localhost:${PORT}/`);
+  // Render the production graph offline with loud loops and a count-in click.
+  // A compressor can let brief peaks exceed full scale, which a device would hard clip.
+  const audio = await ev(async () => {
+    const { Engine } = await import('./js/engine.js');
+    const sampleRate = 48000;
+    const offline = new OfflineAudioContext(1, sampleRate, sampleRate);
+    const AudioContext = window.AudioContext;
+    const engine = new Engine({ bpm: 120, beatsPerBar: 4 });
+    try {
+      window.AudioContext = function () { return offline; };
+      offline.resume = async () => {}; // OfflineAudioContext starts via startRendering().
+      await engine.init();
+    } finally {
+      window.AudioContext = AudioContext;
+      clearInterval(engine.timer);
+    }
+    const loop = offline.createBuffer(1, sampleRate / 5, sampleRate);
+    const signal = loop.getChannelData(0);
+    for (let i = 0; i < signal.length; i++) signal[i] = 4 * Math.sin(i * 2 * Math.PI * 440 / sampleRate);
+    for (const pad of engine.pads) {
+      pad.buffer = loop;
+      engine.startLoopAt(pad, 0.1);
+    }
+    // Rebuilding an existing pad softens a captured dropout without editing its raw PCM.
+    const pad = engine.pads[0];
+    pad.raw = new Float32Array(loop.length).fill(0.5);
+    pad.raw.fill(0, 2048, 2176);
+    pad.sampleRate = sampleRate;
+    pad.lengthSamples = pad.raw.length;
+    engine.rebuild(pad);
+    const rebuilt = pad.buffer.getChannelData(0);
+    const dropoutSmoothed = pad.raw[2047] === 0.5 && pad.raw[2176] === 0.5 && rebuilt[2047] === 0 && rebuilt[2176] === 0;
+    engine.beep(0.2, true);
+    const output = (await offline.startRendering()).getChannelData(0);
+    return { dropoutSmoothed, outputPeak: output.reduce((peak, sample) => Math.max(peak, Math.abs(sample)), 0) };
+  });
+  assert.ok(audio.dropoutSmoothed, 'a saved pad smooths the abrupt edges of a mic dropout');
+  assert.ok(audio.outputPeak > 0.8 && audio.outputPeak < 0.99, `loud pads and count-in stay under full scale (${audio.outputPeak})`);
+  const welcome = page.locator('#splash');
+  assert.match(await welcome.innerText(), /Download all sounds/);
+  assert.match(await welcome.innerText(), /browser can clear saved sounds/);
+  assert.match(await welcome.innerText(), /install Loopsy for offline use/);
+  assert.equal(await welcome.getByRole('button', { name: /install/i }).count(), 0);
+  await page.screenshot({ path: shots + '0-welcome.png' });
+  await page.click('#basicsBtn');
+  await sleep(200);
+  await page.screenshot({ path: shots + '0b-basics.png' });
+  await page.click('#helpSheet .close');
+  assert.deepEqual(
+    await page.locator('.topbar button').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('aria-label'))),
+    ['Menu', 'Stop all loops', 'Record what you play', 'Recordings'],
+  );
+  assert.equal(await page.locator('.topbar .beats').count(), 0);
+  await ev(() => {
+    loopsy.settings.bpm = 160; // 1.5 s bars keep the test quick
+    loopsy.settings.latencyMs = 30;
+  });
+  await page.click('.len-picker [data-bars="1"]');
+  await page.screenshot({ path: shots + '1-empty.png' });
+  const pads = page.locator('.pad:not(.sing)');
+
+  // Record pad 1: silent count-in (no beeps scheduled) then one bar.
+  await pads.nth(0).click();
+  await until(() => loopsy.engine.pads[0].state === 'armed');
+  assert.equal(await ev(() => loopsy.engine.pads[0].rec.beeps.length), 0, 'count-in is silent by default');
+  await sleep(600);
+  await page.screenshot({ path: shots + '2-countin.png' });
+  await until(() => loopsy.engine.pads[0].state === 'recording');
+  await sleep(1100);
+  await page.screenshot({ path: shots + '3-recording-last-bar.png' });
+  await until(() => loopsy.engine.pads[0].state === 'ready');
+  const info = await ev(() => {
+    const p = loopsy.engine.pads[0];
+    return { dur: p.buffer.duration, playing: !!p.source, enabled: p.enabled };
+  });
+  assert.ok(Math.abs(info.dur - 1.5) < 0.002, `loop is exactly one bar (${info.dur})`);
+  assert.ok(info.playing && info.enabled, 'loop starts playing after recording');
+  assert.ok(!(await page.locator('#toast').isVisible()), 'no install invite after one loop');
+
+  // Record a 2-bar loop on pad 2 while pad 1 plays: it must start at the top of pad 1's loop.
+  await page.click('.len-picker [data-bars="2"]');
+  await pads.nth(1).click();
+  await until(() => loopsy.engine.pads[1].rec);
+  const syncErr = await ev(() => {
+    const [a, b] = loopsy.engine.pads;
+    const len = a.buffer.duration;
+    const ph = (((b.rec.start - a.playFrom) % len) + len) % len;
+    return Math.min(ph, len - ph);
+  });
+  assert.ok(syncErr < 1e-6, 'new recording starts when the playing loop comes round');
+  await until(() => loopsy.engine.pads[1].state === 'recording');
+  await pads.nth(1).click();
+  await page.keyboard.press('2');
+  await until(() => loopsy.engine.pads[1].state === 'ready', null, 9000);
+  const duration = await ev(() => loopsy.engine.pads[1].buffer.duration);
+  assert.ok(Math.abs(duration - 3) < 0.002, 'tapping a recording pad still captures two full bars');
+  await page.getByRole('button', { name: 'Install', exact: true }).click();
+  assert.ok(await page.locator('#installSheet').isVisible(), 'the second loop opens an optional route to installation');
+  await page.click('#installSheet .close');
+  await until(() => !loopsy.engine.pads[1].rec, null, 6000);
+  await sleep(700);
+  await page.screenshot({ path: shots + '4-two-loops.png' });
+
+  // Turn pad 2 off, then on again: it must restart from its beginning, on the top of the cycle.
+  await pads.nth(1).click();
+  await until(() => !loopsy.engine.pads[1].source, null, 4000);
+  await pads.nth(1).click();
+  const relaunch = await ev(() => {
+    const [a, b] = loopsy.engine.pads;
+    const len = a.buffer.duration;
+    const ph = (((b.loopStartAt - a.playFrom) % len) + len) % len;
+    return { fromTop: Math.abs(b.playFrom - b.loopStartAt), sync: Math.min(ph, len - ph) };
+  });
+  assert.ok(relaunch.fromTop < 1e-9, 'a loop always starts from its beginning');
+  assert.ok(relaunch.sync < 1e-6, 'and lines up with the loops already playing');
+
+  // Long-press pad 2 → options → trim.
+  const box = await pads.nth(1).boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await sleep(650);
+  await page.mouse.up();
+  assert.ok(await page.locator('#padSheet').evaluate((d) => d.open), 'long press opens pad options');
+  await page.click('#padTrim');
+  await sleep(300);
+  const cb = await page.locator('#trimCanvas').boundingBox();
+  await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(cb.x + cb.width / 2 + 30, cb.y + cb.height / 2, { steps: 5 });
+  await page.mouse.up();
+  assert.ok((await ev(() => loopsy.engine.pads[1].trimStart - loopsy.engine.pads[1].defaultStart)) > 0, 'trim window moves');
+  assert.ok(await ev(() => !!loopsy.engine.pads[1].source), 'the pad plays while you trim');
+  await page.screenshot({ path: shots + '5-trim.png' });
+  // Silence a part: drag across it; the loop keeps its length.
+  const lenBefore = await ev(() => loopsy.engine.pads[1].buffer.length);
+  await page.click('#trimMode [data-mode="silence"]');
+  await page.mouse.move(cb.x + cb.width * 0.4, cb.y + cb.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(cb.x + cb.width * 0.55, cb.y + cb.height / 2, { steps: 5 });
+  await page.mouse.up();
+  const muted = await ev(() => {
+    const p = loopsy.engine.pads[1];
+    return { kinds: p.edits.map((e) => e.type), len: p.buffer.length };
+  });
+  assert.deepEqual(muted, { kinds: ['mute'], len: lenBefore }, 'a part is silenced and the length is unchanged');
+  await sleep(200);
+  await page.screenshot({ path: shots + '5c-silence.png' });
+  // Move a part: select a bit, then drag the selection along. Compare with pad 1 meanwhile.
+  await page.selectOption('#trimCompare', '0');
+  await page.click('#trimMode [data-mode="part"]');
+  const y = cb.y + cb.height / 2;
+  await page.mouse.move(cb.x + cb.width * 0.62, y);
+  await page.mouse.down();
+  await page.mouse.move(cb.x + cb.width * 0.7, y, { steps: 4 });
+  await page.mouse.up();
+  await page.mouse.move(cb.x + cb.width * 0.66, y);
+  await page.mouse.down();
+  await page.mouse.move(cb.x + cb.width * 0.69, y, { steps: 4 });
+  await page.mouse.up();
+  const moved = await ev(() => {
+    const p = loopsy.engine.pads[1];
+    const m = p.edits.at(-1);
+    return { type: m.type, later: m.shift > 0, len: p.buffer.length };
+  });
+  assert.deepEqual(moved, { type: 'move', later: true, len: lenBefore }, 'a selected part moves later, length unchanged');
+  await sleep(200);
+  await page.screenshot({ path: shots + '5d-move-part-compare.png' });
+  await page.click('#silenceUndo');
+  assert.equal(await ev(() => loopsy.engine.pads[1].edits.length), 1, 'undo takes back the last change');
+  await page.click('#trimSheet .primary');
+
+  // Record pad 3 while loops play, tapping mid-way through the loop cycle: it waits for the
+  // loops to come round, so it starts exactly at the top, together with them.
+  await until(() => {
+    const e = loopsy.engine;
+    const ph = (((e.now - e.origin) % (2 * e.bar)) + 2 * e.bar) % (2 * e.bar);
+    return ph > 0.05 * e.bar && ph < 0.2 * e.bar;
+  });
+  const tapAt = await ev(() => loopsy.engine.now);
+  await pads.nth(2).click();
+  await until(() => loopsy.engine.pads[2].state === 'armed');
+  const lead = await ev((t) => (loopsy.engine.pads[2].rec.start - t) / loopsy.engine.bar, tapAt);
+  assert.ok(lead > 0.7 && lead <= 2.05, `waits for the top of the 2-bar loop (${lead.toFixed(2)} bars)`);
+  await page.screenshot({ path: shots + '5a-waiting-for-top.png' });
+  await until(() => loopsy.engine.pads[2].state === 'armed' && loopsy.engine.pads[2].rec.start - loopsy.engine.now < loopsy.engine.bar * 0.5);
+  await page.screenshot({ path: shots + '5b-count-in-hand.png' });
+  await until(() => loopsy.engine.pads[2].state === 'ready' && loopsy.engine.pads[2].source, null, 9000);
+  const turned = await ev(() => {
+    const [, b, c] = loopsy.engine.pads;
+    const len = b.buffer.duration;
+    const ph = (((c.playFrom - b.playFrom) % len) + len) % len;
+    return { startBar: c.startBar, sync: Math.min(ph, len - ph) };
+  });
+  assert.equal(turned.startBar % 2, 0, 'take began at the top of the loop cycle');
+  assert.ok(turned.sync < 1e-6, 'and its beginning lines up with the other loops');
+
+  // Send pad 2's sound as a file, then load it onto pad 3: it comes back as a 2-bar loop.
+  const longPress = (i) => pads.nth(i).locator('.cog').click(); // the ⚙ opens a pad's options
+  await longPress(1);
+  const [padWav] = await Promise.all([page.waitForEvent('download'), page.click('#padSave')]);
+  const padPath = shots + 'pad.wav';
+  await padWav.saveAs(padPath);
+  await page.click('#padSheet .close');
+  await ev(() => loopsy.engine.clear(loopsy.engine.pads[2]));
+  await longPress(2);
+  assert.ok(await page.locator('#padSheet').evaluate((d) => d.open && d.classList.contains('empty')), 'empty pad offers to load a sound');
+  await page.setInputFiles('#padFile', padPath);
+  await until(() => loopsy.engine.pads[2].hasSound);
+  const loaded = await ev(() => {
+    const [, b, c] = loopsy.engine.pads;
+    return { bars: c.bars, mode: c.mode, same: c.buffer.length === b.buffer.length };
+  });
+  assert.deepEqual(loaded, { bars: 2, mode: 'loop', same: true }, 'a sent pad sound loads back onto the grid');
+  await ev(() => loopsy.engine.clear(loopsy.engine.pads[2]));
+
+  // Sing on top: one tap records pads + voice, second tap saves.
+  await page.click('.pad.sing');
+  await until(() => loopsy.engine.session && loopsy.settings.liveMic, null, 3000);
+  await sleep(1500);
+  await page.screenshot({ path: shots + '6-singing.png' });
+  await page.click('.pad.sing');
+  await until(() => document.getElementById('takesCount').textContent === '1', null, 4000);
+  assert.equal(await ev(() => loopsy.settings.liveMic), false, 'Sing turns the mic back off');
+  // MP3 encoding is deferred until requested, avoiding work while looping.
+  await page.click('#takesBtn');
+  await page.locator('#takesList [data-a="mp3"]').first().click();
+  const hasMp3 = () => ev(async () => (await (await import('./js/storage.js')).listTakes()).some((t) => t.mp3?.size > 1000));
+  for (let i = 0; i < 150 && !(await hasMp3()); i++) await sleep(100);
+  const head = await ev(async () => {
+    const t = (await (await import('./js/storage.js')).listTakes()).find((x) => x.mp3);
+    return [...new Uint8Array(await t.mp3.slice(0, 2).arrayBuffer())];
+  });
+  assert.ok(head[0] === 0xff && (head[1] & 0xe0) === 0xe0, 'MP3 starts with a frame header');
+  await page.locator('#takesSheet .close').click();
+
+  // Rec: records just the pads — the mic stays out of it.
+  await page.click('#recBtn');
+  await until(() => loopsy.engine.session);
+  assert.equal(await ev(() => loopsy.settings.liveMic), false, 'Rec leaves the mic out');
+  await sleep(1200);
+  await page.screenshot({ path: shots + '6b-rec-pads.png' });
+  // Tapping Sing mid-take adds the voice from then on.
+  await page.click('.pad.sing');
+  await until(() => loopsy.settings.liveMic);
+  await sleep(500);
+  await page.click('#recBtn');
+  await until(() => document.getElementById('takesCount').textContent === '2', null, 4000);
+  assert.ok(await ev(async () => (await (await import('./js/storage.js')).listTakes()).some((t) => t.name.endsWith('(with voice)'))));
+  await page.click('#recBtn');
+  await until(() => loopsy.engine.session);
+  await sleep(800);
+  await page.click('#recBtn');
+  await until(() => document.getElementById('takesCount').textContent === '3', null, 4000);
+  const names = await ev(async () => (await (await import('./js/storage.js')).listTakes()).map((t) => t.name));
+  assert.ok(names.some((n) => !n.includes('voice')), 'a pads-only take');
+
+  await pads.nth(0).click();
+  await pads.nth(1).click();
+  await until(() => loopsy.engine.pads.slice(0, 2).every((pad) => !pad.source));
+
+  // Name this board in Soundboards, then start fresh without a discard prompt.
+  await page.click('#boardName');
+  await page.fill('#projectName', 'Humming ideas');
+  await page.click('#projectsSheet .close');
+  await page.click('#newBoardBtn');
+  await until(() => !loopsy.engine.pads[0].raw && loopsy.projects.current.name !== 'Humming ideas');
+  assert.ok(!(await page.locator('#newSheet').isVisible()), 'a named board skips the discard prompt');
+  assert.match(await page.locator('#toastMsg').textContent(), /Soundboard “Humming ideas” saved/);
+  assert.match(await page.locator('#boardNameText').textContent(), /Soundboard/);
+
+  // Record something in the new board, then "Don't save" it — and undo that.
+  await pads.nth(3).click();
+  await until(() => loopsy.engine.pads[3].state === 'ready', null, 9000);
+  await pads.nth(3).click();
+  await until(() => !loopsy.engine.pads[3].source);
+  const throwaway = await ev(() => loopsy.projects.current.name);
+  await page.click('#newBoardBtn');
+  await page.screenshot({ path: shots + '9-new-ask.png' });
+  await page.click('#newDiscard');
+  await until(() => !loopsy.engine.pads[3].raw);
+  await page.click('#toastAction'); // Undo
+  await until((name) => loopsy.engine.pads[3].raw && loopsy.projects.current.name === name, throwaway);
+  const empties = await ev(async () => (await (await import('./js/storage.js')).listProjects()).filter((p) => !p.padCount).length);
+  assert.equal(empties, 0, 'no empty soundboards left behind');
+
+  // Soundboards: back up "Humming ideas" to a file and open it again as a copy.
+  await page.click('#boardName');
+  await sleep(200);
+  await page.locator('#projectList li', { hasText: 'Humming ideas' }).locator('[data-a="open"]').click();
+  await until(() => loopsy.engine.pads[0].raw && loopsy.projects.current.name === 'Humming ideas');
+  await page.screenshot({ path: shots + '9c-soundboards.png' });
+  const [archive] = await Promise.all([page.waitForEvent('download'), page.click('#exportWavs')]);
+  assert.equal(archive.suggestedFilename(), 'Humming-ideas-sounds.zip');
+  const archivePath = await archive.path();
+  execFileSync('unzip', ['-tqq', archivePath]);
+  const wavs = execFileSync('unzip', ['-Z1', archivePath], { encoding: 'utf8' }).trim().split('\n');
+  assert.deepEqual(wavs, ['Humming-ideas-pad1.wav', 'Humming-ideas-pad2.wav'], 'the ZIP contains every recorded pad');
+  for (const name of wavs) {
+    const wav = execFileSync('unzip', ['-p', archivePath, name]);
+    assert.equal(wav.toString('ascii', 0, 4), 'RIFF');
+    assert.equal(wav.toString('ascii', 8, 12), 'WAVE');
+  }
+  assert.equal(await ev(() => window.sharedFileNames), undefined, 'download skipped the available share sheet');
+  await page.click('#shareWavs');
+  assert.deepEqual(await ev(() => window.sharedFileNames), wavs, 'share offers the individual WAVs');
+  const [backup] = await Promise.all([page.waitForEvent('download'), page.click('#exportBoard')]);
+  const backupPath = shots + 'backup.loopsy';
+  await backup.saveAs(backupPath);
+  await page.setInputFiles('#importFile', backupPath);
+  const boards = () => ev(async () => (await (await import('./js/storage.js')).listProjects()).filter((p) => p.name === 'Humming ideas').length);
+  for (let i = 0; i < 40 && (await boards()) < 2; i++) await sleep(100);
+  assert.equal(await boards(), 2, 'backup opens as its own soundboard');
+  await until(() => loopsy.engine.pads[1].hasSound);
+  await page.click('#projectsSheet .close');
+
+  // Help box: ask a question (Enter mustn't close the sheet), and the suggest tab.
+  await page.click('#menuBtn');
+  await page.click('[data-open="helpbox"]');
+  await page.fill('#askInput', 'how do I save as mp3');
+  await page.press('#askInput', 'Enter');
+  assert.ok(await page.locator('#helpBoxSheet').evaluate((d) => d.open), 'Enter keeps the help box open');
+  assert.match(await page.locator('#askLog .a').first().textContent(), /MP3/);
+  await page.screenshot({ path: shots + '9d-help.png' });
+  await page.click('[data-tab="suggest"]');
+  assert.ok(await page.locator('#suggestText').isVisible());
+  await page.click('#helpBoxSheet .close');
+
+  // Reload: same project, pads restored from storage; getting started shows every visit.
+  await page.reload();
+  await page.click('body');
+  await until(() => loopsy.engine.pads[1].hasSound, null, 4000);
+  assert.ok(await page.locator('#splash').evaluate((e) => !e.hidden), 'getting started shows on every visit');
+  await page.click('#startBtn');
+  await pads.nth(1).click();
+  await until(() => !!loopsy.engine.pads[1].source);
+  await pads.nth(1).click();
+  await until(() => !loopsy.engine.pads[1].source);
+
+  const layoutKind = () => ev(() => document.getElementById('grid').dataset.layout);
+  for (const [w, h, kind, name] of [
+    [844, 390, '4x2-side', '10-landscape'],
+    [372, 828, '2x4', '11-cover-screen'],
+    [930, 864, '3x3', '12-unfolded'],
+    [864, 930, '3x3', '13-unfolded-portrait'],
+  ]) {
+    await page.setViewportSize({ width: w, height: h });
+    await sleep(300);
+    assert.equal(await layoutKind(), kind, name);
+    await page.screenshot({ path: shots + name + '.png' });
+  }
+
+  // Half-open like a book: pretend the browser reports two side-by-side segments.
+  await page.setViewportSize({ width: 930, height: 864 });
+  await ev(() => {
+    window.viewport = { segments: [new DOMRect(0, 0, 465, 864), new DOMRect(465, 0, 465, 864)] };
+    window.dispatchEvent(new Event('resize'));
+  });
+  await sleep(300);
+  assert.equal(await layoutKind(), 'hinge');
+  const clear = await ev(() =>
+    [...document.querySelectorAll('.pad')].every((el) => {
+      const r = el.getBoundingClientRect();
+      return r.right <= 465 || r.left >= 465;
+    }),
+  );
+  assert.ok(clear, 'no pad straddles the fold');
+  await page.screenshot({ path: shots + '14-book-posture.png' });
+
+  assert.deepEqual(errors, []);
+  console.log('e2e ok — screenshots in test/screens/');
+} finally {
+  await browser.close();
+  server.kill();
+}

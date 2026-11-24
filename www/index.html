@@ -1,5 +1,466 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#f7f5ef"><meta name="apple-mobile-web-app-capable" content="yes"><link rel="manifest" href="manifest.webmanifest"><link rel="apple-touch-icon" href="icons/apple-touch-icon.png"><link rel="stylesheet" href="style.css"><title>Loopsy Doopsy Compatible</title></head>
-<body><main><header><h1>Loopsy Doopsy <small>Compatible</small></h1><p>Tap an empty pad to record. Tap it again to play or stop.</p></header>
-<section class="controls" aria-label="Loop settings"><label>Tempo <input id="bpm" type="number" min="40" max="200" value="90" inputmode="numeric"> BPM</label><label>Next loop <select id="bars"><option value="1">1 bar</option><option value="2">2 bars</option><option value="4" selected>4 bars</option><option value="8">8 bars</option></select></label><button id="stop" type="button">Stop all</button></section>
-<p class="hint">One bar to get ready, then recording starts. Headphones help prevent the speaker being recorded. Keep the app open while looping.</p><p id="status" role="status" aria-live="polite">Your sounds stay on this device. Download anything you want to keep.</p><section id="pads" aria-label="Loop pads"></section><p class="foot">Saved in this browser; browser storage can be cleared. Use the download button on a pad to keep a WAV file.</p></main><script type="module" src="js/app.js"></script></body></html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#1c1b22" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Loopsy" />
+    <meta name="description" content="Record colourful, perfectly timed loops on eight pads and jam over the top." />
+    <title>Loopsy Doopsy Compatible</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <div class="chrome">
+    <header class="topbar">
+      <button class="icon-btn" id="menuBtn" aria-label="Menu">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+      </button>
+
+      <button class="stop-all" id="stopAll" type="button" aria-label="Stop all loops">Stop all</button>
+      <button class="rec-btn" id="recBtn" aria-label="Record what you play">
+        <span class="rec-dot"></span><span class="rec-label" id="recLabel">Rec</span>
+      </button>
+
+      <button class="icon-btn" id="takesBtn" aria-label="Recordings">
+        <svg viewBox="0 0 24 24"><path d="M9 18V5l11-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="17" cy="16" r="3" /></svg>
+        <span class="count" id="takesCount" hidden>0</span>
+      </button>
+    </header>
+
+    <div class="boardbar">
+      <button class="board-name" id="boardName" aria-label="Soundboards"><span id="boardNameText">My loops</span> <span class="caret">▾</span></button>
+      <button class="new-board" id="newBoardBtn">＋ New soundboard</button>
+    </div>
+    </div>
+
+    <main class="grid" id="grid"></main>
+
+    <footer class="dock">
+      <div class="len-picker" role="radiogroup" aria-label="Length of next loop">
+        <span>Next loop</span>
+        <button data-bars="1">1</button>
+        <button data-bars="2">2</button>
+        <button data-bars="4">4</button>
+        <button data-bars="8">8</button>
+        <span>bars</span>
+      </div>
+      <p class="hint" id="hint">Tap an empty pad to record · tap to play · ⚙ for options</p>
+      <p class="browser-note" id="ffNote" hidden>
+        <span>For the best sound, use Chrome: Firefox can make recordings crackle.</span>
+        <button type="button" id="ffNoteClose" aria-label="Hide this note">✕</button>
+      </p>
+    </footer>
+
+    <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="toastAction"></button></div>
+
+    <!-- Pad options -->
+    <dialog class="sheet" id="padSheet">
+      <form method="dialog">
+        <h2 id="padTitle">Pad</h2>
+        <p class="sub" id="padEmptyNote" hidden>Tap the pad to record into it, or load a sound someone sent you (from Loopsy Doopsy, a voice memo, any WAV, MP3 or M4A).</p>
+        <div class="needs-sound">
+        <div class="seg" id="modeSeg">
+          <button type="button" data-mode="loop">∞ Loop<small>tap on / off, stays in time</small></button>
+          <button type="button" data-mode="oneshot">1× One-shot<small>tap to play once</small></button>
+        </div>
+        <label class="row">Volume <span class="val" id="padVolVal"></span> <input type="range" id="padVol" min="0" max="1.5" step="0.01" /></label>
+        <div class="actions">
+          <button type="button" id="padTrim">✂︎ Trim &amp; silence</button>
+          <button type="button" id="padRerec">● Re-record</button>
+          <button type="button" id="padClear" class="danger">Clear</button>
+        </div>
+        </div>
+        <div class="actions">
+          <button type="button" id="padSave" class="needs-sound">💾 Save this sound</button>
+          <button type="button" id="padShare" class="needs-sound">📤 Share…</button>
+          <button type="button" id="padLoad">📂 Load a sound file</button>
+        </div>
+        <input type="file" id="padFile" hidden />
+        <button class="close" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- Trim editor -->
+    <dialog class="sheet wide" id="trimSheet">
+      <form method="dialog">
+        <h2>Trim <small id="trimInfo"></small></h2>
+        <p class="sub" id="trimHelp"></p>
+        <div class="seg tabs" id="trimMode">
+          <button type="button" data-mode="move">↔ Whole loop</button>
+          <button type="button" data-mode="part">✋ Move a part</button>
+          <button type="button" data-mode="silence">🔇 Silence</button>
+        </div>
+        <label class="row" id="trimCompareRow">Compare with <select id="trimCompare"></select></label>
+        <canvas id="trimCanvas"></canvas>
+        <div class="actions" id="silenceRow" hidden>
+          <button type="button" id="silenceUndo">↶ Undo last change</button>
+          <button type="button" id="silenceClear">Undo all changes</button>
+        </div>
+        <div class="trim-row">
+          <button type="button" id="nudgeL" aria-label="10 ms earlier">‹</button>
+          <div class="len-seg" id="trimLen">
+            <button type="button" data-len="free">Free</button>
+            <button type="button" data-len="1">1</button>
+            <button type="button" data-len="2">2</button>
+            <button type="button" data-len="4">4</button>
+            <button type="button" data-len="8">8</button>
+          </div>
+          <button type="button" id="nudgeR" aria-label="10 ms later">›</button>
+        </div>
+        <label class="row check"><input type="checkbox" id="trimSnap" checked /> Snap to 1/16 notes</label>
+        <label class="row check"><input type="checkbox" id="trimFold" /> Wrap overrun into the start (keeps a held note ringing across the loop)</label>
+        <div class="actions">
+          <button type="button" id="trimPreview">▶ Preview</button>
+          <button type="button" id="trimReset">Reset</button>
+          <button type="button" id="trimCancel">Cancel</button>
+          <button value="ok" class="primary">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Tempo & settings -->
+    <dialog class="sheet" id="settingsSheet">
+      <form method="dialog">
+        <h2>Tempo &amp; settings</h2>
+        <div class="tempo-row">
+          <button type="button" id="bpmDown">−</button>
+          <input type="number" id="bpmInput" min="40" max="240" step="1" inputmode="decimal" />
+          <button type="button" id="bpmUp">+</button>
+          <button type="button" id="tapBtn" class="tap">Tap</button>
+        </div>
+        <label class="row">Beats per bar
+          <select id="bpbInput"><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option></select>
+        </label>
+        <p class="note" id="tempoLock" hidden>Tempo is locked while pads hold recordings so everything stays in time. Clear all pads to change it.</p>
+
+        <h3>Recording</h3>
+        <label class="row check"><input type="checkbox" id="setCountIn" /> Count-in: a bar's countdown on the pad before recording starts</label>
+        <label class="row check"><input type="checkbox" id="setBeeps" /> Beep during the count-in (it stops before recording, so it isn't recorded)</label>
+        <label class="row check"><input type="checkbox" id="setAutoPlay" /> Start looping as soon as a recording finishes</label>
+        <label class="row">Microphone
+          <select id="setMic"><option value="">Default</option></select>
+        </label>
+        <button type="button" class="wide-btn" id="micTestBtn">🔍 Microphone check</button>
+        <p class="sub" id="micNote">Pick the mic that sounds best. With Bluetooth headphones, the phone's own mic usually sounds better: a Bluetooth headset's mic often switches it into a muffled “phone call” mode.</p>
+        <label class="row">Mic boost <span class="val" id="boostVal">off</span>
+          <input type="range" id="setBoost" min="1" max="4" step="0.05" />
+        </label>
+        <p class="sub">Turn this up if humming or quiet singing looks small on the meter.</p>
+        <label class="row check"><input type="checkbox" id="setEcho" /> Echo cancellation: stops the loops leaking from the speaker into new recordings</label>
+        <p class="sub">On by default on phones, where the speaker sits right next to the mic. With wired headphones you can turn it off for the clearest sound.</p>
+
+        <h3>Singing on top</h3>
+        <label class="row check"><input type="checkbox" id="setMonitor" /> Hear your voice through the app (headphones only!)</label>
+
+        <h3>Sound</h3>
+        <label class="row check"><input type="radio" name="latMode" value="smooth" /> Smooth: fewer crackles (best on most phones)</label>
+        <label class="row check"><input type="radio" name="latMode" value="fast" /> Fast: lowest delay (if your device keeps up)</label>
+        <p class="sub">Hear crackles? Choose Smooth. Recordings still line up: the extra delay is corrected for (if you used Calibrate before, run it again after switching).</p>
+
+        <h3>Latency</h3>
+        <p class="sub">How late the mic hears things. Calibrate with the speaker on and headphones off. Every phone and computer is a bit different, and <b>Bluetooth headphones add extra delay</b> (often a fifth of a second, and it varies between headphones), so recordings can land late. Wired headphones are best. With Bluetooth, try 200 here, then fine-tune any loop with ⚙ → Trim.</p>
+        <div class="tempo-row">
+          <input type="number" id="latInput" placeholder="auto" min="0" max="500" step="1" inputmode="numeric" /><span>ms</span>
+          <button type="button" id="calBtn">Calibrate</button>
+        </div>
+
+        <div class="actions">
+          <button type="button" id="clearAll" class="danger">Clear all pads</button>
+          <button value="close" class="primary">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Takes -->
+    <dialog class="sheet" id="takesSheet">
+      <form method="dialog">
+        <h2>Recordings</h2>
+        <p class="sub">Tap <b>Rec</b> to record what you play on the pads, or <b>Sing on top</b> to add your voice too. <b>MP3</b> shares a small file that plays anywhere; <b>WAV</b> is full quality. The sounds themselves live in your soundboard.</p>
+        <ul class="takes" id="takesList"></ul>
+        <button class="close" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- Menu -->
+    <dialog class="sheet" id="menuSheet">
+      <form method="dialog">
+        <div class="menu">
+          <button type="button" data-open="projects">🎛 Soundboards<small id="menuProject"></small></button>
+          <button type="button" data-open="welcome">🚀 Getting started<small>record, play and save</small></button>
+          <button type="button" data-open="help">💡 Looping basics<small>bars, layers and leaving space</small></button>
+          <button type="button" data-open="settings">⚙︎ Tempo &amp; settings</button>
+          <button type="button" data-open="helpbox">💬 FAQ &amp; suggestions<small>how things work, or send an idea or a problem</small></button>
+          <button type="button" data-open="install" id="menuInstall">📲 Install the app<small>on your iPhone, Android or computer</small></button>
+        </div>
+        <p class="version">Version <span id="appVersion"></span> · <button type="button" id="updateBtn">Check for updates</button></p>
+        <button class="close" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- Soundboards -->
+    <dialog class="sheet" id="projectsSheet">
+      <form method="dialog">
+        <h2>Soundboards</h2>
+        <p class="sub">A soundboard keeps all eight pads' sounds and your tempo. It saves as you go.</p>
+        <label class="row">Name <input type="text" id="projectName" maxlength="40" autocomplete="off" /></label>
+        <div class="actions">
+          <button type="button" class="primary" id="exportWavs">Download all sounds</button>
+          <button type="button" id="shareWavs" hidden>Share sounds…</button>
+        </div>
+        <p class="sub">Downloads one ZIP with a WAV for each pad you’ve recorded.</p>
+        <div class="actions">
+          <button type="button" id="exportBoard">📦 Back up / send</button>
+          <button type="button" id="importBoard">📂 Open a backup</button>
+          <button type="button" id="dupProject">Duplicate</button>
+        </div>
+        <input type="file" id="importFile" hidden />
+        <p class="sub">A backup keeps the whole soundboard in one file you can reopen or send to a friend.</p>
+        <h3>Your soundboards</h3>
+        <ul class="takes" id="projectList"></ul>
+        <button class="close" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- New soundboard -->
+    <dialog class="sheet" id="newSheet">
+      <form method="dialog">
+        <section data-step="ask" class="steps">
+          <h2>Start a new soundboard?</h2>
+          <p class="sub" id="newAskText"></p>
+          <button type="button" class="primary big-btn" id="newSave">Save it, then start new</button>
+          <button type="button" class="big-btn danger" id="newDiscard">Don’t save</button>
+          <button type="button" class="big-btn" id="newCancel">Cancel</button>
+        </section>
+        <section data-step="name" class="steps" hidden>
+          <h2>What shall we call it?</h2>
+          <p class="sub">You’ll find it under Soundboards (tap its name above the pads).</p>
+          <input type="text" id="newName" maxlength="40" autocomplete="off" enterkeyhint="done" />
+          <button type="button" class="primary big-btn" id="newNameSave">Save &amp; start new</button>
+          <button type="button" class="big-btn" id="newNameBack">Back</button>
+        </section>
+      </form>
+    </dialog>
+
+    <!-- Microphone: ask first, and help when it can't be opened -->
+    <dialog class="sheet" id="micSheet">
+      <form method="dialog">
+        <section data-mic="ask" class="steps">
+          <h2>🎤 Can Loopsy use your microphone?</h2>
+          <p class="sub">It's needed to record your voice. Your sounds stay on this device; nothing is uploaded.</p>
+          <p class="sub">Your browser will ask next. Choose <b>Allow</b>, <b>While using the app</b> or <b>Only this time</b>.</p>
+          <p class="sub" id="micIosNote" hidden>On iPhone and iPad, Safari asks again each time you open Loopsy. That's Apple's rule for web apps; just tap <b>Allow</b>.</p>
+          <button type="button" class="primary big-btn" id="micAllow">Allow microphone</button>
+          <button type="button" class="big-btn" id="micNotNow">Not now</button>
+          <button type="button" class="link-btn" id="micCheckBtn2">Having trouble? Run a microphone check</button>
+        </section>
+        <section data-mic="help" class="steps" hidden>
+          <h2 id="micHelpTitle"></h2>
+          <p class="sub" id="micHelpText"></p>
+          <ol class="mic-steps" id="micHelpSteps"></ol>
+          <details class="others" id="micOthers" hidden><summary>Using a different browser?</summary><div id="micOthersList"></div></details>
+          <p class="sub mic-code" id="micHelpCode"></p>
+          <button type="button" class="primary big-btn" id="micRetry">Try again</button>
+          <button type="button" class="big-btn" id="micCheckBtn">🔍 Run a microphone check</button>
+          <button type="button" class="big-btn" id="micClose">Close</button>
+        </section>
+        <p class="mic-status" id="micStatus" hidden></p>
+        <section data-mic="check" class="steps" hidden>
+          <h2>🔍 Microphone check</h2>
+          <p class="sub">Each step in turn. If one fails, it says why. Make a sound when it's listening.</p>
+          <ul class="check-list" id="checkList"></ul>
+          <div class="level" id="checkLevel" hidden><i></i></div>
+          <button type="button" class="primary big-btn" id="checkSend" disabled>📨 Send this report</button>
+          <button type="button" class="big-btn" id="checkAgain">Run it again</button>
+          <button type="button" class="big-btn" id="checkClose">Close</button>
+        </section>
+      </form>
+    </dialog>
+
+    <!-- Help & suggestions -->
+    <dialog class="sheet wide" id="helpBoxSheet">
+      <form method="dialog">
+        <h2>FAQ &amp; suggestions</h2>
+        <div class="seg tabs" role="tablist">
+          <button type="button" role="tab" data-tab="ask">❓ FAQ</button>
+          <button type="button" role="tab" data-tab="suggest">💡 Suggest / report</button>
+        </div>
+        <section data-panel="ask" class="ask">
+          <div class="ask-log" id="askLog" hidden></div>
+          <div class="ask-row" id="askForm" role="search">
+            <input type="text" id="askInput" maxlength="1000" autocomplete="off" enterkeyhint="send" placeholder="Search, e.g. save as MP3" />
+            <button type="button" class="primary" id="askBtn">Search</button>
+          </div>
+          <h3>Questions people ask</h3>
+          <ul class="common" id="commonQs"></ul>
+        </section>
+        <section data-panel="suggest" hidden>
+          <p class="sub">Got an idea for a new feature, or found something that doesn't work? Tell the maker.</p>
+          <label class="row">This is
+            <select id="suggestKind"><option value="idea">an idea</option><option value="bug">something not working</option><option value="other">something else</option></select>
+          </label>
+          <textarea id="suggestText" rows="5" maxlength="4000" placeholder="What would you like, or what went wrong? If something broke, what were you doing just before?"></textarea>
+          <label class="row check"><input type="checkbox" id="suggestDevice" checked /> Include what phone or computer I'm using (helps fix problems)</label>
+          <div class="actions"><button type="button" class="primary" id="sendSuggestion">Send</button></div>
+
+        </section>
+        <button class="close" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- Install -->
+    <dialog class="sheet" id="installSheet">
+      <form method="dialog" class="help">
+        <h2>Install Loopsy Doopsy</h2>
+        <p>Install Loopsy Doopsy to open it like any other app and use it offline. Your sounds are saved on this device. To keep a separate copy, use <b>Download all sounds</b> in Soundboards.</p>
+        <div class="actions" id="installNowRow" hidden>
+          <button type="button" class="primary" id="installNow">📲 Install now</button>
+        </div>
+        <h3 id="installFor"></h3>
+        <ol id="installSteps"></ol>
+        <p class="sub" id="installIosNote" hidden>Can't hear anything? Check the ring/silent switch on the side of the phone.</p>
+        <details class="others"><summary>Using a different browser?</summary><div id="installOthers"></div></details>
+        <p class="sub">On a computer: <b>1–8</b> tap the pads and <b>R</b> records what you play.</p>
+        <button class="close primary" value="close">Done</button>
+      </form>
+    </dialog>
+
+    <!-- Looping basics -->
+    <dialog class="sheet wide" id="helpSheet">
+      <form method="dialog" class="help">
+        <h2>Looping basics</h2>
+
+        <section>
+          <h3>Beats, bars and loops</h3>
+          <p>A <b>beat</b> is one tap of your foot. A <b>bar</b> is a group of beats, usually four: <i>1-2-3-4</i>. A <b>loop</b> is a few bars that repeat forever. Here every loop is 1, 2, 4 or 8 bars long, so they always line up with each other.</p>
+        </section>
+
+        <section>
+          <h3>How long should a loop be?</h3>
+          <ul>
+            <li><b>1 bar</b> is a groove: a beatbox pattern, or a "dum-dum" bass you repeat.</li>
+            <li><b>2 bars</b> is a riff: a bassline or rhythm with a little call and answer.</li>
+            <li><b>4 bars</b> is the sweet spot: a chord pattern or a short tune. Most songs think in fours.</li>
+            <li><b>8 bars</b> is a whole phrase, like a verse melody. Lovely, but harder to nail in one go, so try 4 first.</li>
+          </ul>
+          <p>A good mix: one longer loop as the backbone, shorter loops for rhythm on top.</p>
+        </section>
+
+        <section>
+          <h3>Build it in layers</h3>
+          <ol>
+            <li><b>Bass:</b> a low hum or "bom… bom".</li>
+            <li><b>Rhythm:</b> mouth percussion, clicks, "ts" and "k" sounds.</li>
+            <li><b>Harmony:</b> long "oohs" and "aahs" that sit underneath.</li>
+            <li><b>A hook:</b> a short tune people would hum back.</li>
+            <li><b>Sing on top:</b> words, riffs, anything. This part doesn't loop, so it can wander.</li>
+          </ol>
+        </section>
+
+        <section>
+          <h3>Leave space</h3>
+          <p>Yes, space is your friend. Every layer adds up, so keep each one simple and leave gaps; a rest in one loop is room for another. Use different heights, low, middle and high, so the layers don't sit on top of each other. If it sounds muddy, take a loop out rather than adding another.</p>
+        </section>
+
+        <section>
+          <h3>Timing</h3>
+          <p>Before recording, the pad counts down during the final bar. Start when it says <b>Recording</b>; the beats left show when your phrase will end. Slightly early or late? Tap the pad's ⚙ → <b>Trim</b> and slide it into place while it plays with the others. Headphones stop the loops leaking into the mic.</p>
+        </section>
+
+        <section>
+          <h3>Make it a song</h3>
+          <p>Songs come from loops coming in and dropping out. Try: <i>one loop → build up → everything → drop to one or two → all back in → end on one</i>. Tap pads to bring them in and out while <b>● Rec</b> or <b>Sing on top</b> records it. Open <b>Recordings (♫)</b> to listen and save the take.</p>
+        </section>
+
+        <section>
+          <h3>What's "eight-track"?</h3>
+          <p>Before computers, studios recorded onto tape machines with separate <b>tracks</b>. An 8-track could record eight parts separately, then mix them together. Your eight pads work the same way: eight separate parts you can bring in and out. (There was also the 1970s 8-track cartridge, a tape for car stereos.)</p>
+        </section>
+
+        <button class="close primary" value="close">Got it</button>
+      </form>
+    </dialog>
+
+    <!-- Welcome / getting started (every visit; audio also needs a tap to unlock on phones) -->
+    <div class="splash" id="splash">
+      <div class="logo">
+        <span style="--c: var(--p0)"></span><span style="--c: var(--p1)"></span><span style="--c: var(--p2)"></span><span style="--c: var(--p3)"></span>
+      </div>
+      <h1>Loopsy Doopsy Compatible</h1>
+      <p class="lead">Hum, sing and stack your voice into songs.</p>
+      <ol>
+        <li><b>Tap a pad to record.</b> Start singing after the count-in.</li>
+        <li><b>Tap a loop to play or stop it.</b> Record on other pads to add layers.</li>
+        <li><b>Download sounds you want to keep.</b> Tap the soundboard name, then <b>Download all sounds</b>. Your browser can clear saved sounds over time. You can also install Loopsy for offline use.</li>
+      </ol>
+      <div class="splash-actions">
+        <button class="primary big" id="startBtn">Let's loop</button>
+        <button class="ghost" id="basicsBtn">New to looping? Read the basics</button>
+      </div>
+    </div>
+
+    <!-- If something goes wrong while starting -->
+    <div class="boot-error" id="bootError" hidden>
+      <p><b>Loopsy didn't start properly.</b> This usually fixes it:</p>
+      <button type="button" class="primary" id="bootFix">Fix it (reload the newest version)</button>
+      <small id="bootErrorMsg"></small>
+    </div>
+
+    <!-- Opened over plain http: browsers block the microphone (and offline use) there. -->
+    <div class="boot-error" id="insecure" hidden>
+      <p><b>This page isn't using a secure connection (https)</b>, so your browser won't let it use the microphone.</p>
+      <a class="primary-link" id="insecureLink" href="#">Open the secure version</a>
+      <small>If that doesn't open, the site's secure certificate isn't ready yet: try again later.</small>
+    </div>
+
+    <!-- Safety net, in plain script so it works even if the app's code fails to load:
+         "Let's loop" always closes the welcome screen, and a start-up failure shows a fix. -->
+    <script>
+      (function () {
+        var $ = function (id) { return document.getElementById(id); };
+        // Plain http: switch to https if it's there, otherwise say why the mic won't work.
+        if (location.protocol === 'http:' && !/^(localhost|127\.|\[::1\]$)/.test(location.hostname)) {
+          var secure = 'https://' + location.host + location.pathname + location.search + location.hash;
+          $('insecureLink').href = secure;
+          var warn = setTimeout(function () { $('insecure').hidden = false; }, 4000);
+          fetch('https://' + location.host + location.pathname.replace(/[^/]*$/, '') + 'manifest.webmanifest', { mode: 'no-cors', cache: 'no-store' })
+            .then(function () { clearTimeout(warn); location.replace(secure); })
+            .catch(function () { clearTimeout(warn); $('insecure').hidden = false; });
+        }
+        function close() { $('splash').hidden = true; }
+        $('startBtn').addEventListener('click', close);
+        $('basicsBtn').addEventListener('click', close);
+        var shown = false;
+        function trouble(msg) {
+          if (window.loopsyReady || shown) return;
+          shown = true;
+          $('bootErrorMsg').textContent = msg || '';
+          $('bootError').hidden = false;
+        }
+        window.addEventListener('error', function (e) {
+          var t = e.target;
+          trouble(t && t.src ? 'Couldn’t load ' + t.src.split('/').pop() : e.message);
+        }, true);
+        window.addEventListener('unhandledrejection', function (e) {
+          trouble(String((e.reason && e.reason.message) || e.reason));
+        });
+        setTimeout(function () { trouble('It took too long to start.'); }, 15000);
+        $('bootFix').addEventListener('click', function () {
+          $('bootFix').textContent = 'Reloading…';
+          var regs = navigator.serviceWorker && navigator.serviceWorker.getRegistration ? navigator.serviceWorker.getRegistration('./') : Promise.resolve(null);
+          regs.then(function (r) { if (r && new URL(r.scope).pathname === new URL('./', location.href).pathname) return r.unregister(); })
+            .then(function () { return window.caches ? caches.keys() : []; })
+            .then(function (ks) { return Promise.all(ks.filter(function (k) { return k.indexOf('loopsy-compatible-') === 0; }).map(function (k) { return caches.delete(k); })); })
+            .catch(function () {})
+            .then(function () { location.reload(); });
+        });
+      })();
+    </script>
+    <script type="module" src="js/main.js"></script>
+  </body>
+</html>

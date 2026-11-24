@@ -15,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: npm test
+      - name: Stamp release version
+        run: |
+          build="$(date -u +%Y-%m-%d)-${GITHUB_SHA::7}"
+          sed -i "s/__BUILD__/${build}/" www/js/version.js www/sw.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

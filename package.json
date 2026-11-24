@@ -1,1 +1,12 @@
-{"name":"loopsy-doopsy-compatible","version":"0.1.0","private":true,"type":"module","scripts":{"test":"node --test test/*.test.js"}}
+{
+  "name": "loopsy-doopsy-compatible",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Colourful 8-pad loop recorder: an installable web app (PWA)",
+  "scripts": {
+    "start": "python3 -m http.server --bind 127.0.0.1 8224 --directory www",
+    "test": "node --test test/*.test.js",
+    "test:e2e": "node test/e2e.mjs"
+  }
+}

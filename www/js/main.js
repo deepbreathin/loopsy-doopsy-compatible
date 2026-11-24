@@ -1,0 +1,1012 @@
+import { Engine, LOOP_LENGTHS, PAD_COUNT } from './engine.js';
+import { decodeWavBlob, readAudioFile, toMp3 } from './audio-files.js';
+import * as layout from './layout.js';
+import { Projects } from './projects.js';
+import { HelpBox } from './help.js';
+import { MicGate, fillOthers } from './mic.js';
+import { INSTALL, NAMES, browser } from './device.js';
+import { VERSION } from './version.js';
+import { TrimEditor } from './trim.js';
+import * as store from './storage.js';
+import { encodeWav } from './wav.js';
+import { fitBars, mod, tapTempo } from './timing.js';
+
+const $ = (id) => document.getElementById(id);
+
+const DEFAULTS = {
+  bpm: 90,
+  beatsPerBar: 4,
+  loopBars: 4,
+  countIn: true,
+  countInBeeps: false,
+  autoPlay: true,
+  latencyMs: null,
+  monitor: false,
+  liveMic: false,
+  micBoost: 1,
+};
+
+const settings = { ...DEFAULTS };
+const engine = new Engine(settings);
+// ?lab: expose the engine for on-device audio testing (tools/mic-lab).
+if (new URLSearchParams(location.search).has('lab')) window.loopsyEngine = engine;
+let song = null; // { sections: [{ bars, pads: [bool × 8] }] }
+const projects = new Projects({
+  engine,
+  settings,
+  defaults: DEFAULTS,
+  getSong: () => song,
+  setSong: (s) => (song = s ?? null),
+  toast: (...a) => toast(...a),
+  share,
+  download,
+  onSwitch: () => {
+    syncLoopLength();
+    const name = projects.current?.name ?? '';
+    $('menuProject').textContent = name;
+    $('boardNameText').textContent = name;
+  },
+});
+const save = () => projects.save();
+const trim = new TrimEditor(engine, { onClose: save });
+const padEls = [];
+const helpBox = new HelpBox({ toast: (...a) => toast(...a) });
+
+// ---------- toast ----------
+
+let toastTimer;
+function toast(msg, action, fn) {
+  $('toastMsg').textContent = msg;
+  const b = $('toastAction');
+  b.textContent = action || '';
+  b.onclick = () => {
+    $('toast').hidden = true;
+    fn?.();
+  };
+  $('toast').hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => ($('toast').hidden = true), action ? 5000 : 2600);
+}
+
+// Asks for the microphone before it's first needed, and explains (with the fix) when it
+// can't be opened.
+const mic = new MicGate({ engine, toast: (...a) => toast(...a) });
+const micError = (e) => mic.help(e);
+
+// ---------- pads ----------
+
+let singView;
+
+function buildPads() {
+  const grid = $('grid');
+  for (let i = 0; i < PAD_COUNT; i++) {
+    const el = document.createElement('div');
+    el.className = 'pad';
+    el.style.setProperty('--c', `var(--p${i})`);
+    el.innerHTML = `<span class="pad-label"></span><button type="button" class="cog" aria-label="Pad ${i + 1} settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/><circle cx="12" cy="12" r="6.2"/></svg></button><span class="num">${i + 1}</span>`;
+    grid.append(el);
+    // The cog opens the pad's settings: a tap or click, so it works the same on phones and computers.
+    const cog = el.querySelector('.cog');
+    for (const ev of ['pointerdown', 'pointerup', 'pointercancel']) cog.addEventListener(ev, (e) => e.stopPropagation());
+    cog.addEventListener('click', (e) => {
+      e.stopPropagation();
+      engine.init();
+      if (engine.pads[i].state === 'ready' || engine.pads[i].state === 'empty') openPadSheet(engine.pads[i]);
+    });
+    padEls.push({ el });
+    bindPad(el, engine.pads[i]);
+  }
+  // The Sing tile: one tap records the pads plus your voice on top.
+  const el = document.createElement('button');
+  el.className = 'pad sing';
+  el.setAttribute('aria-label', 'Sing on top');
+  el.textContent = 'Sing on top';
+  grid.append(el);
+  singView = { el };
+  el.addEventListener('click', toggleSing);
+  const relayout = () => {
+    layout.apply(grid, [...padEls.map((p) => p.el), el]);
+  };
+  new ResizeObserver(relayout).observe(grid);
+  window.addEventListener('resize', relayout); // also fires when a foldable changes posture
+}
+
+function bindPad(el, pad) {
+  let timer = null;
+  let long = false;
+  let down = false;
+  el.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (pad.state === 'recording') return;
+    down = true;
+    long = false;
+    el.classList.add('pressed');
+    // One-shots fire on touch-down so they feel like an instrument.
+    if (pad.state === 'ready' && pad.mode === 'oneshot') {
+      engine.trigger(pad);
+      flash(el);
+    }
+    timer = setTimeout(() => {
+      long = true;
+      if (pad.state === 'ready' || pad.state === 'empty') openPadSheet(pad);
+    }, 480);
+  });
+  const up = (e, cancelled) => {
+    if (!down) return;
+    down = false;
+    clearTimeout(timer);
+    el.classList.remove('pressed');
+    if (long || cancelled) return;
+    tap(pad, el);
+  };
+  el.addEventListener('pointerup', (e) => up(e, false));
+  el.addEventListener('pointercancel', (e) => up(e, true));
+  el.addEventListener('pointerleave', (e) => up(e, true));
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+function flash(el) {
+  el.classList.remove('hit');
+  void el.offsetWidth;
+  el.classList.add('hit');
+}
+
+async function tap(pad, el) {
+  switch (pad.state) {
+    case 'empty':
+      try {
+        if (!(await mic.ready())) break;
+        await engine.record(pad);
+      } catch (e) {
+        micError(e);
+      }
+      break;
+    case 'armed':
+      engine.cancelRecording(pad);
+      break;
+    case 'ready':
+      if (pad.mode === 'loop') {
+        engine.trigger(pad);
+        flash(el);
+      }
+      break;
+  }
+}
+
+// ---------- pad sheet ----------
+
+let sheetPad = null;
+function openPadSheet(pad) {
+  sheetPad = pad;
+  $('padTitle').textContent = `Pad ${pad.index + 1}`;
+  $('padVol').value = pad.volume;
+  showVol();
+  const empty = !pad.hasSound;
+  $('padSheet').classList.toggle('empty', empty);
+  $('padEmptyNote').hidden = !empty;
+  syncModeSeg();
+  $('padSheet').showModal();
+}
+function syncModeSeg() {
+  for (const b of $('modeSeg').children) {
+    b.setAttribute('aria-checked', b.dataset.mode === sheetPad.mode);
+    b.disabled = b.dataset.mode === 'loop' && sheetPad.free;
+  }
+}
+$('modeSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b || b.disabled) return;
+  engine.setMode(sheetPad, b.dataset.mode);
+  syncModeSeg();
+  save();
+});
+const showVol = () => ($('padVolVal').textContent = `${Math.round(sheetPad.volume * 100)}%`);
+$('padVol').oninput = (e) => {
+  engine.setVolume(sheetPad, Number(e.target.value));
+  showVol();
+  save();
+};
+$('padTrim').onclick = () => {
+  const pad = sheetPad;
+  $('padSheet').close();
+  trim.open(pad);
+};
+$('padRerec').onclick = async () => {
+  const pad = sheetPad;
+  const snap = engine.snapshot(pad);
+  $('padSheet').close();
+  if (!(await mic.ready())) return;
+  try {
+    await engine.record(pad);
+    toast('Re-recording…', 'Undo', () => engine.restore(pad, snap));
+  } catch (e) {
+    engine.restore(pad, snap);
+    micError(e);
+  }
+};
+// One pad's sound as a WAV, exactly as it loops. The tempo and length ride along inside the
+// file, so another Loopsy Doopsy can drop it straight onto its grid.
+function padSoundFile(pad) {
+  const meta = {
+    app: 'loopsy',
+    v: 1,
+    bpm: settings.bpm,
+    beatsPerBar: settings.beatsPerBar,
+    bars: pad.free ? null : pad.bars,
+    free: pad.free,
+    mode: pad.mode,
+  };
+  const board = (projects.current?.name ?? 'loopsy').replace(/[^\w-]+/g, '-');
+  return { blob: encodeWav(pad.buffer.getChannelData(0), pad.buffer.sampleRate, meta), name: `${board}-pad${pad.index + 1}.wav` };
+}
+// Save always downloads the file; Share (where the device can share files) opens the share sheet.
+$('padSave').onclick = () => {
+  if (!sheetPad?.buffer) return;
+  const f = padSoundFile(sheetPad);
+  download([f]);
+  toast(`Saved ${f.name} to your downloads`);
+};
+$('padShare').onclick = () => sheetPad?.buffer && share([padSoundFile(sheetPad)], `Pad ${sheetPad.index + 1}`);
+const canShareFiles = (() => {
+  try {
+    return !!navigator.canShare?.({ files: [new File(['x'], 'x.wav', { type: 'audio/wav' })] });
+  } catch {
+    return false;
+  }
+})();
+$('padShare').hidden = $('shareWavs').hidden = !canShareFiles;
+$('padLoad').onclick = () => $('padFile').click();
+$('padFile').onchange = (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  const pad = sheetPad;
+  if (!f || !pad) return;
+  $('padSheet').close();
+  loadPadFile(pad, f);
+};
+
+async function loadPadFile(pad, file) {
+  await engine.init();
+  let a;
+  try {
+    a = await readAudioFile(engine.ctx, file);
+  } catch (e) {
+    console.warn(e);
+    return toast('Couldn’t read that sound file');
+  }
+  if (!a.samples.length) return toast('That sound file is empty');
+  const m = a.meta?.app === 'loopsy' ? a.meta : null;
+  const others = engine.pads.some((p) => p !== pad && p.hasSound);
+  // An empty board takes on the tempo the sound was made at.
+  if (m?.bpm && !others && !engine.running) {
+    settings.bpm = m.bpm;
+    settings.beatsPerBar = m.beatsPerBar || settings.beatsPerBar;
+  }
+  const sameTempo = m && Math.abs(m.bpm - settings.bpm) < 0.05 && m.beatsPerBar === settings.beatsPerBar;
+  const dur = a.samples.length / a.sampleRate;
+  let bars = null;
+  if (m) bars = sameTempo && !m.free ? m.bars : null;
+  else bars = fitBars(dur, engine.bar, LOOP_LENGTHS);
+  const snap = engine.snapshot(pad);
+  const had = pad.hasSound;
+  engine.loadSound(pad, a.samples, a.sampleRate, bars);
+  if (bars && m?.mode === 'oneshot') engine.setMode(pad, 'oneshot');
+  save();
+  const undo = had
+    ? () => {
+        engine.restore(pad, snap);
+        save();
+      }
+    : null;
+  const msg = bars
+    ? `Loaded onto pad ${pad.index + 1} as a ${plural(bars, 'bar')} loop`
+    : m && !sameTempo
+      ? `Loaded as a one-shot: it was made at ${fmtBpm(m.bpm)} bpm, this board is ${fmtBpm(settings.bpm)}`
+      : `Loaded as a one-shot. ⚙ → Trim to make it a loop`;
+  toast(msg, undo && 'Undo', undo);
+}
+
+$('padClear').onclick = () => {
+  const pad = sheetPad;
+  $('padSheet').close();
+  const snap = engine.clear(pad);
+  save();
+  toast(`Pad ${pad.index + 1} cleared`, 'Undo', () => {
+    engine.restore(pad, snap);
+    save();
+  });
+};
+
+// ---------- record a performance ----------
+//
+// A "take" records what comes out of the app. Rec takes just the pads (no mic, so no echo);
+// Sing on top adds your voice. Tapping Sing during a Rec take adds your voice from then on.
+
+let sessionStarted = 0;
+
+function setLive(on) {
+  settings.liveMic = on;
+  engine.applyLiveSettings();
+}
+
+async function startTake({ voice }) {
+  await engine.init();
+  if (voice && !(await mic.ready())) return false;
+  setLive(voice);
+  try {
+    if (voice) await engine.ensureMic();
+    await engine.startSession();
+  } catch (e) {
+    setLive(false);
+    micError(e);
+    return false;
+  }
+  sessionStarted = Date.now();
+  renderStatus();
+  return true;
+}
+
+// Bring the backing in if it's switched on but stopped.
+function startBacking() {
+  if (!engine.running && engine.pads.some((p) => p.enabled && p.hasSound && p.mode === 'loop')) engine.startTransport();
+}
+
+$('stopAll').onclick = () => {
+  engine.stopTransport();
+  engine.pads.forEach(p => { p.enabled = false; });
+  renderStatus();
+};
+
+$('recBtn').onclick = async () => {
+  if (engine.session) return stopTake();
+  if (await startTake({ voice: false })) {
+    startBacking();
+    toast('Recording the pads — tap them to bring loops in and out');
+  }
+};
+
+async function toggleSing() {
+  if (engine.session && !settings.liveMic) {
+    // Already recording the pads: add your voice from here on.
+    if (!(await mic.ready())) return;
+    setLive(true);
+    renderStatus();
+    try {
+      await engine.ensureMic();
+      toast('Your voice is in the take now');
+    } catch (e) {
+      setLive(false);
+      micError(e);
+    }
+    return;
+  }
+  if (engine.session) return stopTake();
+  if (await startTake({ voice: true })) startBacking();
+}
+
+const fmtTime = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+
+async function stopTake() {
+  const voice = settings.liveMic;
+  const result = await engine.stopSession();
+  setLive(false);
+  if (!result || result.samples.length < result.sampleRate * 0.3) return toast('Recording too short');
+  const blob = encodeWav(result.samples, result.sampleRate);
+  const takes = await store.listTakes();
+  const take = {
+    id: Date.now(),
+    name: `${projects.current?.name ?? 'Jam'} · take ${takes.length + 1}${voice ? ' (with voice)' : ''}`,
+    created: Date.now(),
+    duration: result.samples.length / result.sampleRate,
+    blob,
+  };
+  await store.saveTake(take);
+  refreshTakesCount();
+  toast(`Saved “${take.name}”`, 'Open', openTakes);
+  // MP3 encoding runs only when requested, not while the next loop is playing.
+
+}
+
+
+// ---------- menu & sheets ----------
+
+$('menuBtn').onclick = () => {
+  $('menuProject').textContent = projects.current?.name ?? '';
+  $('menuSheet').showModal();
+};
+$('menuSheet').addEventListener('click', (e) => {
+  const what = e.target.closest('button')?.dataset.open;
+  if (!what) return;
+  $('menuSheet').close();
+  ({ projects: () => projects.show(), help: openHelp, settings: openSettings, install: openInstall, helpbox: () => helpBox.open(), welcome: showSplash })[what]();
+});
+$('boardName').onclick = () => projects.show();
+$('newBoardBtn').onclick = async () => {
+  if (engine.session) await stopTake();
+  projects.newSoundboard();
+};
+$('takesBtn').onclick = () => openTakes();
+
+// ---------- install (PWA) ----------
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); // offer it ourselves instead of a browser banner
+  installPrompt = e;
+  $('installNowRow').hidden = false;
+});
+const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+$('menuInstall').hidden = standalone;
+window.addEventListener('appinstalled', () => {
+  $('menuInstall').hidden = true;
+  $('installNowRow').hidden = true;
+  installPrompt = null;
+});
+
+// Fill an <ol> with steps.
+function steps(ol, list) {
+  ol.innerHTML = '';
+  for (const st of list) {
+    const li = document.createElement('li');
+    li.textContent = st;
+    ol.append(li);
+  }
+}
+
+function showSplash() {
+  $('splash').hidden = false;
+}
+
+async function installNow() {
+  if (!installPrompt) return false;
+  installPrompt.prompt();
+  const { outcome } = await installPrompt.userChoice;
+  installPrompt = null;
+  $('installNowRow').hidden = true;
+  if (outcome === 'accepted') $('menuInstall').hidden = true;
+  return outcome === 'accepted';
+}
+// Offer installation once the visitor has made two loops, even across visits.
+const INSTALL_INVITE_KEY = 'loopsy.install-loops';
+const readInstallLoops = () => {
+  try {
+    return Number(localStorage.getItem(INSTALL_INVITE_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+};
+let installLoops = readInstallLoops();
+engine.addEventListener('recorded', () => {
+  if ($('menuInstall').hidden || installLoops >= 2) return;
+  installLoops++;
+  try {
+    localStorage.setItem(INSTALL_INVITE_KEY, installLoops);
+  } catch {
+    // The invite can still appear in this visit.
+  }
+  if (installLoops === 2) toast('Enjoying Loopsy? Install it to play offline.', 'Install', openInstall);
+});
+
+function openInstall() {
+  const b = browser();
+  $('installFor').textContent = b === 'inapp' ? 'First, open it in your phone’s browser' : `You’re using ${NAMES[b]}`;
+  steps($('installSteps'), INSTALL[b]);
+  $('installIosNote').hidden = !b.startsWith('ios');
+  fillOthers($('installOthers'), INSTALL);
+  $('installNowRow').hidden = !installPrompt;
+  $('installSheet').showModal();
+}
+$('installNow').onclick = async () => {
+  await installNow();
+  $('installSheet').close();
+};
+
+// ---------- keyboard (computers) ----------
+
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+  if (!$('splash').hidden || document.querySelector('dialog[open]')) return;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) return;
+  engine.init();
+  if (e.key >= '1' && e.key <= String(PAD_COUNT)) {
+    const i = Number(e.key) - 1;
+    const pad = engine.pads[i];
+    if (pad.state === 'ready' && pad.mode === 'oneshot') {
+      engine.trigger(pad);
+      flash(padEls[i].el);
+    } else tap(pad, padEls[i].el);
+  } else if (e.key === 'r' || e.key === 'R') {
+    $('recBtn').click();
+  } else return;
+  e.preventDefault();
+});
+
+function openHelp() {
+  $('helpSheet').showModal();
+  $('helpSheet').querySelector('form').scrollTop = 0;
+}
+
+function syncLoopLength() {
+  for (const b of document.querySelectorAll('.len-picker button')) {
+    b.setAttribute('aria-checked', Number(b.dataset.bars) === settings.loopBars);
+  }
+}
+
+const fmtBpm = (b) => (Number.isInteger(b) ? String(b) : b.toFixed(1));
+
+document.querySelector('.len-picker').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  settings.loopBars = Number(b.dataset.bars);
+  syncLoopLength();
+  save();
+});
+
+// ---------- settings ----------
+
+const checks = {
+  setCountIn: 'countIn',
+  setBeeps: 'countInBeeps',
+  setAutoPlay: 'autoPlay',
+  setMonitor: 'monitor',
+};
+
+// Firefox (measured on Android) splices the microphone audio, worse while a Web Audio engine
+// runs, so recordings crackle; Chrome records cleanly. One quiet line, until it's dismissed.
+const FF_NOTE = 'firefoxNoteHidden';
+try {
+  if (browser().endsWith('firefox') && !localStorage.getItem(FF_NOTE)) $('ffNote').hidden = false;
+} catch {
+  if (browser().endsWith('firefox')) $('ffNote').hidden = false;
+}
+$('ffNoteClose').onclick = () => {
+  $('ffNote').hidden = true;
+  try {
+    localStorage.setItem(FF_NOTE, '1');
+  } catch {
+    /* storage blocked */
+  }
+};
+
+// Echo cancelling belongs to the device (phone speaker or headphones), not to a soundboard:
+// on by default on phones and tablets, kept here once the user changes it.
+const ECHO_KEY = 'echoCancel';
+try {
+  const v = localStorage.getItem(ECHO_KEY);
+  if (v === 'on' || v === 'off') engine.echoCancel = v === 'on';
+} catch {
+  /* storage blocked */
+}
+$('setEcho').onchange = async (e) => {
+  engine.echoCancel = e.target.checked;
+  try {
+    localStorage.setItem(ECHO_KEY, engine.echoCancel ? 'on' : 'off');
+  } catch {
+    /* storage blocked */
+  }
+  await engine.reopenMic().catch(micError);
+};
+
+// Keep the sound mode on this device if the user chose one explicitly.
+const LAT_KEY = 'latencyMode';
+try {
+  const mode = localStorage.getItem(LAT_KEY);
+  if (mode === 'smooth' || mode === 'fast') engine.latencyMode = mode;
+} catch {
+  /* storage blocked */
+}
+for (const r of document.querySelectorAll('input[name="latMode"]')) {
+  r.onchange = async () => {
+    try {
+      localStorage.setItem(LAT_KEY, r.value);
+    } catch {
+      /* storage blocked */
+    }
+    await engine.setLatencyMode(r.value);
+    toast(r.value === 'smooth' ? 'Smooth sound: fewer crackles' : 'Fast sound: lowest delay');
+  };
+}
+
+// Microphone choice is kept on this device (device ids mean nothing on another one).
+const MIC_KEY = 'micId';
+try {
+  engine.micId = localStorage.getItem(MIC_KEY) || '';
+} catch {
+  engine.micId = '';
+}
+
+async function listMics() {
+  const sel = $('setMic');
+  let mics = [];
+  try {
+    mics = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId !== 'default');
+  } catch {
+    /* not available */
+  }
+  sel.innerHTML = '<option value="">Default</option>';
+  mics.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.textContent = d.label || `Microphone ${i + 1}`;
+    sel.append(o);
+  });
+  sel.value = mics.some((d) => d.deviceId === engine.micId) ? engine.micId : '';
+  // Browsers only name the mics once the app has been allowed to use one.
+  sel.disabled = !mics.some((d) => d.label);
+  if (sel.disabled) sel.options[0].textContent = 'Default (record something first to choose)';
+}
+$('setMic').onchange = async (e) => {
+  engine.micId = e.target.value;
+  try {
+    localStorage.setItem(MIC_KEY, engine.micId);
+  } catch {
+    /* storage blocked */
+  }
+  await engine.reopenMic().catch(micError);
+};
+$('micTestBtn').onclick = () => {
+  $('settingsSheet').close();
+  mic.check();
+};
+navigator.mediaDevices?.addEventListener?.('devicechange', () => $('settingsSheet').open && listMics());
+
+function openSettings() {
+  listMics();
+  for (const r of document.querySelectorAll('input[name="latMode"]')) r.checked = r.value === engine.latencyMode;
+  $('bpmInput').value = settings.bpm;
+  $('bpbInput').value = settings.beatsPerBar;
+  $('latInput').value = settings.latencyMs ?? '';
+  $('latInput').placeholder = engine.ctx ? `auto (${Math.round(engine.latency * 1000)})` : 'auto';
+  for (const [id, key] of Object.entries(checks)) $(id).checked = settings[key];
+  $('setEcho').checked = engine.echoCancel;
+  $('setBoost').value = settings.micBoost;
+  showBoost();
+  const locked = engine.anyRecorded();
+  for (const id of ['bpmInput', 'bpmDown', 'bpmUp', 'tapBtn', 'bpbInput']) $(id).disabled = locked;
+  $('tempoLock').hidden = !locked;
+  $('settingsSheet').showModal();
+}
+
+function setBpm(v) {
+  if (!Number.isFinite(v)) return;
+  settings.bpm = Math.round(Math.min(240, Math.max(40, v)) * 10) / 10;
+  $('bpmInput').value = settings.bpm;
+  save();
+}
+$('bpmInput').onchange = (e) => setBpm(Number(e.target.value));
+$('bpmDown').onclick = () => setBpm(Math.round(settings.bpm) - 1);
+$('bpmUp').onclick = () => setBpm(Math.round(settings.bpm) + 1);
+const taps = [];
+$('tapBtn').onpointerdown = () => {
+  const t = performance.now() / 1000;
+  if (taps.length && t - taps.at(-1) > 2) taps.length = 0;
+  taps.push(t);
+  const bpm = tapTempo(taps);
+  if (bpm) setBpm(bpm);
+};
+$('bpbInput').onchange = (e) => {
+  settings.beatsPerBar = Number(e.target.value);
+  save();
+};
+for (const [id, key] of Object.entries(checks)) {
+  $(id).onchange = async (e) => {
+    settings[key] = e.target.checked;
+    if (key === 'monitor') engine.applyLiveSettings();
+    save();
+  };
+}
+function showBoost() {
+  const db = Math.round(20 * Math.log10(settings.micBoost));
+  $('boostVal').textContent = db ? `+${db} dB` : 'off';
+}
+$('setBoost').oninput = (e) => {
+  settings.micBoost = Number(e.target.value);
+  showBoost();
+  engine.applyLiveSettings();
+  save();
+};
+$('latInput').onchange = (e) => {
+  const v = e.target.value.trim();
+  settings.latencyMs = v === '' ? null : Math.max(0, Math.min(500, Number(v)));
+  save();
+};
+$('calBtn').onclick = async () => {
+  if (!(await mic.ready())) return;
+  const b = $('calBtn');
+  b.disabled = true;
+  b.textContent = 'Listening…';
+  try {
+    const ms = await engine.calibrate();
+    if (ms == null) toast('Couldn’t hear the clicks — turn the volume up and try again');
+    else {
+      settings.latencyMs = ms;
+      $('latInput').value = ms;
+      toast(`Latency set to ${ms} ms`);
+      save();
+    }
+  } catch (e) {
+    micError(e);
+  }
+  b.disabled = false;
+  b.textContent = 'Calibrate';
+};
+$('clearAll').onclick = () => {
+  const snaps = engine.pads.map((p) => (p.raw ? engine.clear(p) : null));
+  $('settingsSheet').close();
+  save();
+  toast('All pads cleared', 'Undo', () => {
+    snaps.forEach((s, i) => s && engine.restore(engine.pads[i], s));
+    save();
+  });
+};
+
+// ---------- takes ----------
+
+const player = new Audio();
+let playingId = null;
+player.onended = () => {
+  playingId = null;
+  renderTakes();
+};
+
+async function refreshTakesCount() {
+  const n = (await store.listTakes().catch(() => [])).length;
+  $('takesCount').hidden = !n;
+  $('takesCount').textContent = n;
+}
+
+async function openTakes() {
+  await renderTakes();
+  if (!$('takesSheet').open) $('takesSheet').showModal();
+}
+$('takesSheet').addEventListener('close', () => {
+  player.pause();
+  playingId = null;
+});
+
+const ICON = {
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z" fill="currentColor" stroke="none"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>',
+  share: '<svg viewBox="0 0 24 24"><path d="M12 3v13M7 8l5-5 5 5M5 14v6h14v-6"/></svg>',
+  bin: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+};
+
+async function renderTakes() {
+  const list = $('takesList');
+  const takes = (await store.listTakes()).sort((a, b) => b.created - a.created);
+  list.innerHTML = '';
+  if (!takes.length) {
+    list.innerHTML = '<li class="empty">No recordings yet</li>';
+    return;
+  }
+  for (const t of takes) {
+    const li = document.createElement('li');
+    const d = new Date(t.created);
+    li.innerHTML = `<button type="button" data-a="play" aria-label="Play">${playingId === t.id ? ICON.pause : ICON.play}</button>
+      <div class="meta"><b></b><small>${fmtTime(t.duration)} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div>
+      <button type="button" data-a="mp3" class="fmt" aria-label="Share or save as MP3">${ICON.share}<small>MP3</small></button>
+      <button type="button" data-a="wav" class="fmt" aria-label="Share or save as WAV"><small>WAV</small></button>
+      <button type="button" data-a="del" aria-label="Delete">${ICON.bin}</button>`;
+    li.querySelector('b').textContent = t.name;
+    li.onclick = async (e) => {
+      const a = e.target.closest('button')?.dataset.a;
+      if (a === 'play') {
+        if (playingId === t.id) {
+          player.pause();
+          playingId = null;
+        } else {
+          URL.revokeObjectURL(player.src);
+          player.src = URL.createObjectURL(t.blob);
+          player.play();
+          playingId = t.id;
+        }
+        renderTakes();
+      } else if (a === 'mp3') {
+        shareTakeMp3(t);
+      } else if (a === 'wav') {
+        shareTake(t);
+      } else if (a === 'del') {
+        if (playingId === t.id) player.pause();
+        await store.deleteTake(t.id);
+        renderTakes();
+        refreshTakesCount();
+        toast(`Deleted “${t.name}”`, 'Undo', async () => {
+          await store.saveTake(t);
+          renderTakes();
+          refreshTakesCount();
+        });
+      }
+    };
+    list.append(li);
+  }
+}
+
+const takeFile = (t, ext) => `${t.name.replace(/\W+/g, '-').replace(/^-|-$/g, '')}.${ext}`;
+const shareTake = (t) => share([{ blob: t.blob, name: takeFile(t, 'wav') }], t.name);
+
+async function shareTakeMp3(t) {
+  let mp3 = t.mp3 ?? (await store.getTake(t.id).catch(() => null))?.mp3;
+  if (!mp3) {
+    toast('Making the MP3…');
+    try {
+      await engine.init();
+      const { samples, sampleRate } = await decodeWavBlob(engine.ctx, t.blob);
+      mp3 = await toMp3(samples, sampleRate);
+      await store.saveTake({ ...t, mp3 });
+    } catch (e) {
+      console.warn(e);
+      return toast('Couldn’t make an MP3 — try WAV');
+    }
+  }
+  t.mp3 = mp3;
+  share([{ blob: mp3, name: takeFile(t, 'mp3') }], t.name);
+}
+
+// The phone's share sheet (WhatsApp, AirDrop, Files…) where there is one, else a download.
+async function share(files, title) {
+  const list = files.map((f) => new File([f.blob], f.name, { type: f.blob.type || 'application/octet-stream' }));
+  if (navigator.canShare?.({ files: list })) {
+    try {
+      await navigator.share({ files: list, title });
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      // Safari only shares straight after a tap; if getting the file ready took too long, ask for another.
+      if (e.name === 'NotAllowedError') return toast('Ready to send', 'Share', () => share(files, title));
+    }
+  }
+  download(files);
+}
+
+// Save files straight to the device (Downloads, or Files on an iPhone).
+function download(files) {
+  for (const f of files) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(f.blob);
+    a.download = f.name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }
+}
+
+// ---------- render loop ----------
+
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+function hintText(t) {
+  const pads = engine.pads;
+  const armed = pads.find((p) => p.state === 'armed');
+  if (armed) {
+    return armed.rec.start - t > engine.bar
+      ? 'Waiting for the loops to come round to the top, then a one-bar count-in. Tap the pad to cancel.'
+      : 'Counting in… tap the pad to cancel.';
+  }
+  if (pads.some((p) => p.state === 'recording')) return 'Recording the full loop.';
+  if (engine.session) {
+    return settings.liveMic
+      ? 'Singing on top — tap the tile again to stop and save'
+      : 'Recording the pads · Rec stops & saves · Sing adds your voice';
+  }
+  if (pads.some((p) => p.pending?.type === 'start')) return 'Coming in from the top when the loops come round';
+  if (!pads.some((p) => p.hasSound)) return 'Tap an empty pad to record · tap to play · ⚙ for options';
+  return 'Tap to play · ⚙ for a pad’s options · Rec records what you play';
+}
+
+// Update text on audio state changes, with a slow clock only during count-in or a take.
+// Loops themselves are scheduled by Web Audio; no animation loop competes with them.
+let statusTimer;
+function renderStatus() {
+  engine.pads.forEach((pad, i) => {
+    const el = padEls[i].el;
+    const label = el.querySelector('.pad-label');
+    let text = 'Tap to record';
+    if (pad.state === 'armed') {
+      const beats = Math.max(1, Math.ceil((pad.rec.start - engine.now) / engine.beat));
+      text = pad.rec.start - engine.now > engine.bar ? 'Waiting for loops' : `Get ready: ${beats}`;
+    } else if (pad.state === 'recording') {
+      text = `Recording · ${Math.max(1, Math.ceil((pad.rec.end - engine.now) / engine.beat))} beats left`;
+    } else if (pad.state === 'processing') text = 'Finishing…';
+    else if (pad.state === 'ready') text = pad.pending ? (pad.enabled ? 'Starting…' : 'Stopping…') : pad.mode === 'oneshot' ? 'Tap to play' : pad.enabled ? 'Playing · tap to stop' : 'Tap to play';
+    if (label.textContent !== text) label.textContent = text;
+    el.classList.toggle('has-sound', !!pad.raw);
+    el.classList.toggle('active', !!pad.enabled);
+    el.classList.toggle('armed', pad.state === 'armed');
+    el.classList.toggle('recording', pad.state === 'recording');
+    el.classList.toggle('processing', pad.state === 'processing');
+    el.setAttribute('aria-label', `Pad ${i + 1}: ${text}`);
+  });
+  const recording = !!engine.session;
+  const live = settings.liveMic;
+  const elapsed = recording ? fmtTime((Date.now() - sessionStarted) / 1000) : '';
+  singView.el.textContent = recording && live ? `Stop singing · ${elapsed}` : 'Sing on top';
+  singView.el.classList.toggle('recording', recording && live);
+  document.body.classList.toggle('session', recording);
+  $('recLabel').textContent = elapsed || 'Rec';
+  const hint = engine.pads.some(p => p.state === 'armed') ? 'Get ready. Tap the pad to cancel.' : engine.pads.some(p => p.state === 'recording') ? 'Recording your loop.' : hintText(engine.now);
+  if ($('hint').textContent !== hint) $('hint').textContent = hint;
+  const timed = recording || engine.pads.some(p => p.state === 'armed' || p.state === 'recording');
+  if (timed && !statusTimer) statusTimer = setInterval(renderStatus, 500);
+  else if (!timed && statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+}
+engine.addEventListener('change', renderStatus);
+engine.addEventListener('transport', renderStatus);
+
+for (const ev of ['recorded', 'saved']) engine.addEventListener(ev, save);
+window.addEventListener('pagehide', () => projects.flush());
+document.addEventListener('visibilitychange', () => document.hidden && projects.flush());
+
+// ---------- boot ----------
+
+// Wire the welcome buttons before booting the soundboards.
+const dismissSplash = () => {
+  $('splash').hidden = true;
+  engine.init();
+};
+$('startBtn').onclick = dismissSplash;
+$('basicsBtn').onclick = () => {
+  dismissSplash();
+  openHelp();
+};
+
+buildPads();
+// Ask the browser to keep our storage (Safari otherwise tidies away sites that go unused).
+navigator.storage?.persist?.().catch(() => {});
+try {
+  // Don't wait forever if the browser's storage is stuck.
+  await Promise.race([projects.boot(), new Promise((_, no) => setTimeout(() => no(new Error('storage is slow')), 8000))]);
+} catch (e) {
+  console.warn('boot', e);
+  toast('Couldn’t open your saved soundboards — you can still play; try reopening the app');
+}
+refreshTakesCount();
+syncLoopLength();
+renderStatus();
+// Phones only let audio start from a gesture; unlock on the first touch anywhere.
+document.addEventListener('pointerdown', () => engine.init(), { once: true, capture: true });
+
+// Version, and a way to make sure you're on the newest one: drop the saved copy of the app
+// and reload. (Soundboards and recordings live in separate storage, so they're untouched.)
+$('appVersion').textContent = VERSION.startsWith('__') ? 'dev' : VERSION;
+$('updateBtn').onclick = async () => {
+  $('updateBtn').textContent = 'Updating…';
+  await projects.flush();
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration?.('./');
+    if (reg && new URL(reg.scope).pathname === new URL('./', location.href).pathname) await reg.unregister();
+    for (const key of (await caches?.keys?.()) ?? []) if (key.startsWith('loopsy-compatible-')) await caches.delete(key);
+  } catch {
+    /* nothing cached */
+  }
+  location.reload();
+};
+
+// Offline support (and what makes it installable).
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker
+    .register('sw.js')
+    .then((reg) => {
+      reg.update().catch(() => {});
+      // An installed app is often resumed rather than reopened, so look for updates then too.
+      document.addEventListener('visibilitychange', () => !document.hidden && reg.update().catch(() => {}));
+    })
+    .catch(() => {});
+  // A new version has taken over: reload into it now if nothing's going on, else offer to.
+  const hadController = !!navigator.serviceWorker.controller;
+  let updating = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || updating) return;
+    updating = true;
+    const busy =
+      engine.running || engine.session || engine.pads.some((p) => p.state === 'armed' || p.state === 'recording' || p.state === 'processing') || document.querySelector('dialog[open]');
+    if (busy) toast('A new version of Loopsy Doopsy is ready', 'Update', () => projects.flush().then(() => location.reload()));
+    else projects.flush().then(() => location.reload());
+  });
+}
+
+window.loopsy = { engine, settings, projects, getSong: () => song, setSong: (s) => (song = s) }; // handy for debugging
+window.loopsyReady = true; // tells the safety net in index.html that the app started
+
+// Never fail silently: if something breaks after starting, say so (and how to recover).
+const oops = (msg) => toast(`Something went wrong: ${String(msg).slice(0, 90)}`, 'Fix', () => $('updateBtn').click());
+window.addEventListener('error', (e) => e.message && !/ResizeObserver|Script error/.test(e.message) && oops(e.message));
+window.addEventListener('unhandledrejection', (e) => oops(e.reason?.message || e.reason));
